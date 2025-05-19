@@ -50,6 +50,8 @@
  * @property {string} tokens_store_path - Path to store the tokens file
  * @property {ChallengeState} state - State configuration
  * @property {boolean} noFSState - Whether to disable the state file
+ * @property {(state: ChallengeState) => Promise<void>} [asyncStoreState] - Optional async function to store state
+ * @property {() => Promise<ChallengeState>} [asyncLoadState] - Optional async function to load state
  */
 
 /** @type {typeof import('node:crypto')} */
@@ -68,7 +70,7 @@ class Cap extends EventEmitter {
   /** @type {Promise<void>|null} */
   _cleanupPromise;
 
-  /** @type {Required<CapConfig>} */
+  /** @type {CapConfig} */
   config;
 
   /**
@@ -78,7 +80,7 @@ class Cap extends EventEmitter {
   constructor(configObj) {
     super();
     this._cleanupPromise = null;
-    /** @type {Required<CapConfig>} */
+    /** @type {CapConfig} */
     this.config = {
       tokens_store_path: DEFAULT_TOKENS_STORE,
       noFSState: false,
@@ -89,8 +91,12 @@ class Cap extends EventEmitter {
       ...configObj,
     };
 
-    if (!this.config.noFSState) {
-        this._loadTokens().catch(() => {});
+    if (this.config.asyncLoadState) {
+      this.config.asyncLoadState().then(state => {
+        if (state) this.config.state = state;
+      }).catch(() => { });
+    } else if (!this.config.noFSState) {
+      this._loadTokens().catch(() => { });
     }
 
     process.on("beforeExit", () => this.cleanup());
@@ -116,18 +122,18 @@ class Cap extends EventEmitter {
     const challenges = Array.from(
       { length: (conf && conf.challengeCount) || 50 },
       () =>
-        /** @type {ChallengeTuple} */ ([
-          crypto
-            .randomBytes(Math.ceil(((conf && conf.challengeSize) || 32) / 2))
-            .toString("hex")
-            .slice(0, (conf && conf.challengeSize) || 32),
-          crypto
-            .randomBytes(
-              Math.ceil(((conf && conf.challengeDifficulty) || 4) / 2)
-            )
-            .toString("hex")
-            .slice(0, (conf && conf.challengeDifficulty) || 4),
-        ])
+        /** @type {ChallengeTuple} */([
+        crypto
+          .randomBytes(Math.ceil(((conf && conf.challengeSize) || 32) / 2))
+          .toString("hex")
+          .slice(0, (conf && conf.challengeSize) || 32),
+        crypto
+          .randomBytes(
+            Math.ceil(((conf && conf.challengeDifficulty) || 4) / 2)
+          )
+          .toString("hex")
+          .slice(0, (conf && conf.challengeDifficulty) || 4),
+      ])
     );
 
     const token = crypto.randomBytes(25).toString("hex");
@@ -181,14 +187,16 @@ class Cap extends EventEmitter {
     const hash = crypto.createHash("sha256").update(vertoken).digest("hex");
     const id = crypto.randomBytes(8).toString("hex");
 
-    if(this?.config?.state?.tokensList) this.config.state.tokensList[`${id}:${hash}`] = expires;
+    if (this?.config?.state?.tokensList) this.config.state.tokensList[`${id}:${hash}`] = expires;
 
-    if(!this.config.noFSState) {
-        await fs.writeFile(
+    if (this.config.asyncStoreState) {
+      await this.config.asyncStoreState(this.config.state);
+    } else if (!this.config.noFSState) {
+      await fs.writeFile(
         this.config.tokens_store_path,
         JSON.stringify(this.config.state.tokensList),
         "utf8"
-        );
+      );
     }
 
     return { success: true, token: `${id}:${vertoken}`, expires };
@@ -210,14 +218,17 @@ class Cap extends EventEmitter {
     await this._waitForTokensList();
 
     if (this.config.state.tokensList[key]) {
-      if (conf && conf.keepToken && !this.config.noFSState) {
+      if (conf && conf.keepToken) {
         delete this.config.state.tokensList[key];
-
-        await fs.writeFile(
-          this.config.tokens_store_path,
-          JSON.stringify(this.config.state.tokensList),
-          "utf8"
-        );
+        if (this.config.asyncStoreState) {
+          await this.config.asyncStoreState(this.config.state);
+        } else if (!this.config.noFSState) {
+          await fs.writeFile(
+            this.config.tokens_store_path,
+            JSON.stringify(this.config.state.tokensList),
+            "utf8"
+          );
+        }
       }
 
       return { success: true };
@@ -232,6 +243,14 @@ class Cap extends EventEmitter {
    * @returns {Promise<void>}
    */
   async _loadTokens() {
+    if (this.config.asyncLoadState) {
+      try {
+        const state = await this.config.asyncLoadState();
+        if (state) this.config.state = state;
+        this._cleanExpiredTokens();
+        return;
+      } catch { }
+    }
     try {
       const dirPath = this.config.tokens_store_path
         .split("/")
@@ -312,11 +331,15 @@ class Cap extends EventEmitter {
       const tokensChanged = this._cleanExpiredTokens();
 
       if (tokensChanged) {
-        await fs.writeFile(
-          this.config.tokens_store_path,
-          JSON.stringify(this.config.state.tokensList),
-          "utf8"
-        );
+        if (this.config.asyncStoreState) {
+          await this.config.asyncStoreState(this.config.state);
+        } else {
+          await fs.writeFile(
+            this.config.tokens_store_path,
+            JSON.stringify(this.config.state.tokensList),
+            "utf8"
+          );
+        }
       }
     })();
 
