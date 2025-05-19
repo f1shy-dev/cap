@@ -172,4 +172,12 @@ type CapConfig = {
    * - Optional async function to load state
    */
   asyncLoadState?: () => Promise<ChallengeState>;
+  /**
+   * - Optional async key-value read function
+   */
+  getKey?: (key: string) => Promise<any>;
+  /**
+   * - Optional async key-value write function
+   */
+  setKey?: (key: string, value: any, expires?: number) => Promise<void>;
 };

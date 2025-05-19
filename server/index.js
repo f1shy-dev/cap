@@ -46,12 +46,21 @@
  */
 
 /**
+ * @typedef {(key: string) => Promise<any>} CapGetKeyFn
+ */
+/**
+ * @typedef {(key: string, value: any, expires?: number) => Promise<void>} CapSetKeyFn
+ */
+
+/**
  * @typedef {Object} CapConfig
  * @property {string} tokens_store_path - Path to store the tokens file
- * @property {ChallengeState} state - State configuration
+ * @property {ChallengeState} state - State configuration (used if no KV provided)
  * @property {boolean} noFSState - Whether to disable the state file
- * @property {(state: ChallengeState) => Promise<void>} [asyncStoreState] - Optional async function to store state
- * @property {() => Promise<ChallengeState>} [asyncLoadState] - Optional async function to load state
+ * @property {(state: ChallengeState) => Promise<void>} [asyncStoreState] - Optional async function to store state (legacy)
+ * @property {() => Promise<ChallengeState>} [asyncLoadState] - Optional async function to load state (legacy)
+ * @property {CapGetKeyFn} [getKey] - Optional async key-value read function
+ * @property {CapSetKeyFn} [setKey] - Optional async key-value write function
  */
 
 /** @type {typeof import('node:crypto')} */
@@ -61,6 +70,8 @@ const fs = require("fs/promises");
 const { EventEmitter } = require("events");
 
 const DEFAULT_TOKENS_STORE = ".data/tokensList.json";
+const CHALLENGE_PREFIX = "challenge:";
+const TOKEN_PREFIX = "token:";
 
 /**
  * Main Cap class
@@ -72,6 +83,9 @@ class Cap extends EventEmitter {
 
   /** @type {CapConfig} */
   config;
+
+  /** @type {boolean} */
+  _useKV;
 
   /**
    * Creates a new Cap instance
@@ -91,16 +105,21 @@ class Cap extends EventEmitter {
       ...configObj,
     };
 
-    if (this.config.asyncLoadState) {
-      this.config.asyncLoadState().then(state => {
-        if (state) this.config.state = state;
-      }).catch(() => { });
+    this._useKV = typeof this.config.getKey === "function" && typeof this.config.setKey === "function";
+
+    if (this._useKV) {
+      // No preloading required; rely on external KV TTLs.
+    } else if (this.config.asyncLoadState) {
+      this.config.asyncLoadState()
+        .then((state) => {
+          if (state) this.config.state = state;
+        })
+        .catch(() => { });
     } else if (!this.config.noFSState) {
       this._loadTokens().catch(() => { });
     }
 
     process.on("beforeExit", () => this.cleanup());
-
     ["SIGINT", "SIGTERM", "SIGQUIT"].forEach((signal) => {
       process.once(signal, () => {
         this.cleanup()
@@ -143,11 +162,22 @@ class Cap extends EventEmitter {
       return { challenge: challenges, expires };
     }
 
-    this.config.state.challengesList[token] = {
-      challenge: challenges,
-      expires,
-      token,
-    };
+    if (this._useKV) {
+      if (this.config.setKey) {
+        const setKey = /** @type {CapSetKeyFn} */ (this.config.setKey);
+        setKey(
+          CHALLENGE_PREFIX + token,
+          { challenge: challenges, expires, token },
+          expires - Date.now()
+        ).catch(() => { });
+      }
+    } else {
+      this.config.state.challengesList[token] = {
+        challenge: challenges,
+        expires,
+        token,
+      };
+    }
 
     return { challenge: challenges, token, expires };
   }
@@ -160,25 +190,45 @@ class Cap extends EventEmitter {
   async redeemChallenge({ token, solutions }) {
     this._cleanExpiredTokens();
 
-    const challengeData = this.config.state.challengesList[token];
+    let challengeData;
+    if (this._useKV) {
+      if (this.config.getKey) {
+        const getKey = /** @type {CapGetKeyFn} */ (this.config.getKey);
+        challengeData = await getKey(CHALLENGE_PREFIX + token);
+      }
+    } else {
+      challengeData = this.config.state.challengesList[token];
+    }
     if (!challengeData || challengeData.expires < Date.now()) {
-      delete this.config.state.challengesList[token];
+      if (!this._useKV) delete this.config.state.challengesList[token];
       return { success: false, message: "Challenge expired" };
     }
 
-    delete this.config.state.challengesList[token];
+    if (this._useKV) {
+      if (this.config.setKey) {
+        const setKeyDel = /** @type {CapSetKeyFn} */ (this.config.setKey);
+        await setKeyDel(CHALLENGE_PREFIX + token, null, 0).catch(() => { });
+      }
+    } else {
+      delete this.config.state.challengesList[token];
+    }
 
-    const isValid = challengeData.challenge.every(([salt, target]) => {
-      const solution = solutions.find(([s, t]) => s === salt && t === target);
-      return (
-        solution &&
-        crypto
-          .createHash("sha256")
-          .update(salt + solution[2])
-          .digest("hex")
-          .startsWith(target)
-      );
-    });
+    const isValid = challengeData.challenge.every(
+      /** @param {[string,string]} tuple */
+      (tuple) => {
+        const salt = tuple[0];
+        const target = tuple[1];
+        const solution = solutions.find((sol) => sol[0] === salt && sol[1] === target);
+        return (
+          solution &&
+          crypto
+            .createHash("sha256")
+            .update(salt + solution[2])
+            .digest("hex")
+            .startsWith(target)
+        );
+      }
+    );
 
     if (!isValid) return { success: false, message: "Invalid solution" };
 
@@ -187,16 +237,27 @@ class Cap extends EventEmitter {
     const hash = crypto.createHash("sha256").update(vertoken).digest("hex");
     const id = crypto.randomBytes(8).toString("hex");
 
-    if (this?.config?.state?.tokensList) this.config.state.tokensList[`${id}:${hash}`] = expires;
+    if (this._useKV) {
+      if (this.config.setKey) {
+        const setKeyTok = /** @type {CapSetKeyFn} */ (this.config.setKey);
+        await setKeyTok(
+          TOKEN_PREFIX + `${id}:${hash}`,
+          expires,
+          expires - Date.now()
+        ).catch(() => { });
+      }
+    } else {
+      if (this?.config?.state?.tokensList) this.config.state.tokensList[`${id}:${hash}`] = expires;
 
-    if (this.config.asyncStoreState) {
-      await this.config.asyncStoreState(this.config.state);
-    } else if (!this.config.noFSState) {
-      await fs.writeFile(
-        this.config.tokens_store_path,
-        JSON.stringify(this.config.state.tokensList),
-        "utf8"
-      );
+      if (this.config.asyncStoreState) {
+        await this.config.asyncStoreState(this.config.state);
+      } else if (!this.config.noFSState) {
+        await fs.writeFile(
+          this.config.tokens_store_path,
+          JSON.stringify(this.config.state.tokensList),
+          "utf8"
+        );
+      }
     }
 
     return { success: true, token: `${id}:${vertoken}`, expires };
@@ -215,11 +276,28 @@ class Cap extends EventEmitter {
     const hash = crypto.createHash("sha256").update(vertoken).digest("hex");
     const key = `${id}:${hash}`;
 
+    if (this._useKV) {
+      const expires = this.config.getKey ? await (/** @type {CapGetKeyFn} */ (this.config.getKey))(TOKEN_PREFIX + key) : undefined;
+      if (expires && expires >= Date.now()) {
+        if (conf && conf.keepToken) {
+          if (this.config.setKey) {
+            const delKey = /** @type {CapSetKeyFn} */ (this.config.setKey);
+            await delKey(TOKEN_PREFIX + key, null, 0).catch(() => { });
+          }
+        }
+        return { success: true };
+      }
+      return { success: false };
+    }
+
     await this._waitForTokensList();
 
     if (this.config.state.tokensList[key]) {
       if (conf && conf.keepToken) {
-        delete this.config.state.tokensList[key];
+        if (this.config.setKey) {
+          const delKey = /** @type {CapSetKeyFn} */ (this.config.setKey);
+          await delKey(TOKEN_PREFIX + key, null, 0).catch(() => { });
+        }
         if (this.config.asyncStoreState) {
           await this.config.asyncStoreState(this.config.state);
         } else if (!this.config.noFSState) {
@@ -230,10 +308,8 @@ class Cap extends EventEmitter {
           );
         }
       }
-
       return { success: true };
     }
-
     return { success: false };
   }
 
@@ -284,6 +360,7 @@ class Cap extends EventEmitter {
    * @returns {boolean} - True if any tokens were changed/removed
    */
   _cleanExpiredTokens() {
+    if (this._useKV) return false; // kv store manages TTL
     const now = Date.now();
     let tokensChanged = false;
 
@@ -309,6 +386,7 @@ class Cap extends EventEmitter {
    * @returns {Promise<void>}
    */
   _waitForTokensList() {
+    if (this._useKV) return Promise.resolve();
     return new Promise((resolve) => {
       const l = () => {
         if (this.config.state.tokensList) {
@@ -325,6 +403,7 @@ class Cap extends EventEmitter {
    * @returns {Promise<void>}
    */
   async cleanup() {
+    if (this._useKV) return; // kv store handles expirations
     if (this._cleanupPromise) return this._cleanupPromise;
 
     this._cleanupPromise = (async () => {
